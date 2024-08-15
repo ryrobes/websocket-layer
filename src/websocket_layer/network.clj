@@ -9,8 +9,7 @@
   (:import (java.io ByteArrayInputStream)
            (org.eclipse.jetty.io EofException)
            (org.eclipse.jetty.websocket.api CloseException WriteCallback RemoteEndpoint)
-           (io.aleph.dirigiste Executors)
-           (java.util.concurrent Executor)
+           (java.util.concurrent Executor ExecutorService ThreadPoolExecutor TimeUnit LinkedBlockingQueue ThreadPoolExecutor$CallerRunsPolicy)
            (java.nio.channels ClosedChannelException)
            (org.eclipse.jetty.websocket.servlet ServletUpgradeRequest)
            (java.util Locale)))
@@ -34,12 +33,21 @@
 (def ^:dynamic *encoder*)
 (def ^:dynamic *decoder*)
 (def ^:dynamic *exception-handler*)
-(def ^:dynamic ^Executor *executor*)
+(def ^:dynamic ^ExecutorService *executor*)
 
 (defmacro quietly
   "Execute the body and return nil if there was an error"
   [& body]
   `(try ~@body (catch Throwable _# nil)))
+
+(defn create-auto-resize-pool [core-pool-size max-pool-size keep-alive-time]
+  (let [queue (LinkedBlockingQueue.)]
+    (ThreadPoolExecutor. core-pool-size
+                         max-pool-size
+                         keep-alive-time
+                         TimeUnit/SECONDS
+                         queue
+                         (ThreadPoolExecutor$CallerRunsPolicy.))))
 
 (defn insignificant? [e]
   (or (nil? e)
@@ -54,29 +62,37 @@
 (defmacro safe-future [& body]
   `(let [fun#
          (bound-fn*
-           (^{:once true} fn* []
-             (try ~@body
-                  (catch Exception e#
-                    (handle-exception e#)))))]
+          (^{:once true} fn* []
+                             (try ~@body
+                                  (catch Exception e#
+                                    (handle-exception e#)))))]
      (.execute *executor* fun#)))
+
+(defn log-pool-stats []
+  (when (instance? ThreadPoolExecutor *executor*)
+    (let [pool ^ThreadPoolExecutor *executor*]
+      (println (format "Pool size: %d, Active threads: %d, Tasks in queue: %d"
+                       (.getPoolSize pool)
+                       (.getActiveCount pool)
+                       (.getQueue pool))))))
 
 (defn send-message! [ws data]
   (let [finished (async/promise-chan)
         callback (#'jws/write-callback
-                   {:write-failed
-                    (fn [e]
-                      (try
-                        (handle-exception e)
-                        (finally
-                          (async/close! finished))))
-                    :write-success
-                    (fn [] (async/close! finished))})]
+                  {:write-failed
+                   (fn [e]
+                     (try
+                       (handle-exception e)
+                       (finally
+                         (async/close! finished))))
+                   :write-success
+                   (fn [] (async/close! finished))})]
     (try
       (jws/send! ws
-        (fn [^RemoteEndpoint endpoint]
-          (when (some? endpoint)
-            (let [msg (*encoder* data)]
-              (.sendString endpoint msg ^WriteCallback callback)))))
+                 (fn [^RemoteEndpoint endpoint]
+                   (when (some? endpoint)
+                     (let [msg (*encoder* data)]
+                       (.sendString endpoint msg ^WriteCallback callback)))))
       (catch Exception e
         (try
           (handle-exception e)
@@ -116,14 +132,17 @@
                      :or   {data {} close false proto :push}}]
 
   (let [closure wl/*state*
-        {:keys [outbound subscriptions]} (deref closure)]
+        {:keys [outbound subscriptions]} (deref closure)
+        ;;_ (log-pool-stats)
+        ]
+    
 
     (case (some-> proto name strings/lower-case keyword)
 
       :request
       (safe-future
-        (let [response (wl/handle-request data)]
-          (async/put! outbound {:data response :proto proto :id topic})))
+       (let [response (wl/handle-request data)]
+         (async/put! outbound {:data response :proto proto :id topic})))
 
       :subscription
       (cond
@@ -137,18 +156,18 @@
 
         :otherwise
         (safe-future
-          (when-some [response (wl/handle-subscription data)]
-            (swap! closure assoc-in [:subscriptions topic] response)
-            (async/go-loop []
-              (if-some [res (async/<! response)]
-                (if (async/>! outbound {:data res :proto proto :id topic})
-                  (recur)
-                  (do (swap! closure update :subscriptions dissoc topic)
-                      (async/close! response)))
-                (let [[{old-subs :subscriptions}]
-                      (swap-vals! closure update :subscriptions dissoc topic)]
-                  (when (contains? old-subs topic)
-                    (async/>! outbound {:proto proto :id topic :close true}))))))))
+         (when-some [response (wl/handle-subscription data)]
+           (swap! closure assoc-in [:subscriptions topic] response)
+           (async/go-loop []
+             (if-some [res (async/<! response)]
+               (if (async/>! outbound {:data res :proto proto :id topic})
+                 (recur)
+                 (do (swap! closure update :subscriptions dissoc topic)
+                     (async/close! response)))
+               (let [[{old-subs :subscriptions}]
+                     (swap-vals! closure update :subscriptions dissoc topic)]
+                 (when (contains? old-subs topic)
+                   (async/>! outbound {:proto proto :id topic :close true}))))))))
 
       :push
       (safe-future (wl/handle-push data)))))
@@ -163,29 +182,31 @@
     (on-command ws (with-open [stream (ByteArrayInputStream. buffer)]
                      (*decoder* stream)))))
 
+
+
 (defn websocket-handler
-  [{:keys [exception-handler encoding encoder decoder middleware target-utilization max-threads]
+  [{:keys [exception-handler encoding encoder decoder middleware max-threads]
     :or   {encoding           :edn
            middleware         []
-           target-utilization 0.8
            max-threads        1000
            exception-handler  (fn [^Exception exception]
                                 (if-some [handler (Thread/getDefaultUncaughtExceptionHandler)]
                                   (.uncaughtException handler (Thread/currentThread) exception)
                                   (.printStackTrace exception)))}}]
+  
   (let [encoder  (or encoder (get-in enc/encodings [encoding :encoder]))
         decoder  (or decoder (get-in enc/encodings [encoding :decoder]))
-        executor (Executors/utilizationExecutor target-utilization max-threads)]
+        executor (create-auto-resize-pool 10 max-threads 60)]
     (->> (Thread. ^Runnable (fn [] (.shutdown executor)))
          (.addShutdownHook (Runtime/getRuntime)))
     (letfn [(message-bindings [handler state]
               (fn [& args]
                 (binding
-                  [wl/*state*          state
-                   *encoder*           encoder
-                   *decoder*           decoder
-                   *executor*          executor
-                   *exception-handler* exception-handler]
+                 [wl/*state*          state
+                  *encoder*           encoder
+                  *decoder*           decoder
+                  *executor*          executor
+                  *exception-handler* exception-handler]
                   (apply handler args))))
             (exception-handling [handler]
               (fn [& args]

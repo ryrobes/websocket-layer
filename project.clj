@@ -1,4 +1,4 @@
-(defproject org.clojars.rutledgepaulv/websocket-layer "0.1.12-SNAPSHOT"
+(defproject com.ryrobes/websocket-layer "0.1.12-SNAPSHOT"
 
   :description
   "A layer of glue for jetty and core.async"
@@ -14,11 +14,15 @@
    ["snapshots" :clojars]]
 
   :dependencies
-  [[org.clojure/clojure "1.10.1"]
-   [org.clojure/core.async "1.0.567"]
-   [io.aleph/dirigiste "0.1.5"]
+  [;[org.clojure/clojure "1.10.1"]
+   ;[org.clojure/core.async "1.0.567"]
+   [org.clojure/clojure "1.11.4"]
+   [org.clojure/core.async "1.6.681"]
+   ;[com.ryrobes/puget "1.3.5-SNAPSHOT"]
+   ;[io.aleph/dirigiste "0.1.5"]
    [info.sunng/ring-jetty9-adapter "0.12.5"]
    [metosin/jsonista "0.2.5"]
+   ;[metosin/jsonista "0.3.10"]
    [com.cognitect/transit-clj "1.0.324"]]
 
   :profiles
