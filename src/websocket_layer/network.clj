@@ -9,7 +9,7 @@
   (:import (java.io ByteArrayInputStream)
            (org.eclipse.jetty.io EofException)
            (org.eclipse.jetty.websocket.api CloseException WriteCallback RemoteEndpoint)
-           (java.util.concurrent Executor ExecutorService ThreadPoolExecutor TimeUnit LinkedBlockingQueue ThreadPoolExecutor$CallerRunsPolicy)
+           (java.util.concurrent Executor ExecutorService ThreadPoolExecutor TimeUnit LinkedBlockingQueue ThreadPoolExecutor$CallerRunsPolicy ThreadFactory)
            (java.nio.channels ClosedChannelException)
            (org.eclipse.jetty.websocket.servlet ServletUpgradeRequest)
            (java.util Locale)))
@@ -40,14 +40,43 @@
   [& body]
   `(try ~@body (catch Throwable _# nil)))
 
+(defn create-named-thread-factory [name-prefix]
+  (let [thread-number (atom 0)
+        security-manager (System/getSecurityManager)
+        thread-group (if security-manager
+                       (.getThreadGroup security-manager)
+                       (.getThreadGroup (Thread/currentThread)))]
+    (reify ThreadFactory
+      (newThread [_ r]
+        (let [thread-name (format "%s-%d" name-prefix (swap! thread-number inc))]
+          (doto (Thread. thread-group r thread-name)
+            (.setDaemon false)
+            (.setPriority Thread/NORM_PRIORITY)))))))
+
 (defn create-auto-resize-pool [core-pool-size max-pool-size keep-alive-time]
-  (let [queue (LinkedBlockingQueue.)]
+  (let [queue (LinkedBlockingQueue.)
+        thread-factory (create-named-thread-factory "websocket-pool")]
     (ThreadPoolExecutor. core-pool-size
                          max-pool-size
                          keep-alive-time
                          TimeUnit/SECONDS
                          queue
+                         thread-factory
                          (ThreadPoolExecutor$CallerRunsPolicy.))))
+
+(defn set-thread-name-with-connection-info [upgrade-request]
+  (let [remote-addr (:remote-addr upgrade-request)
+        uri (:uri upgrade-request)
+        thread-name (format "websocket-%s-%s" (or remote-addr "unknown") (or uri "unknown"))]
+    (.setName (Thread/currentThread) thread-name)))
+
+(defmacro with-named-thread [upgrade-request & body]
+  `(let [original-name# (.getName (Thread/currentThread))]
+     (try
+       (set-thread-name-with-connection-info ~upgrade-request)
+       ~@body
+       (finally
+         (.setName (Thread/currentThread) original-name#)))))
 
 (defn insignificant? [e]
   (or (nil? e)
@@ -74,7 +103,7 @@
       (println (format "Pool size: %d, Active threads: %d, Tasks in queue: %d"
                        (.getPoolSize pool)
                        (.getActiveCount pool)
-                       (.getQueue pool))))))
+                       (.size (.getQueue pool)))))))
 
 (defn send-message! [ws data]
   (let [finished (async/promise-chan)
@@ -101,88 +130,80 @@
     finished))
 
 (defn on-connect [ws]
-  (let [outbound (wl/get-outbound)
-        sender   (bound-fn* send-message!)]
-    (async/go-loop []
-      (when-some [msg (async/<! outbound)]
-        (async/<! (sender ws msg))
-        (recur)))
-    (let [{:keys [id]} (swap! wl/*state* assoc :socket ws)]
-      (swap! wl/sockets assoc id wl/*state*))))
+  (with-named-thread (:upgrade-request @wl/*state*)
+    (let [outbound (wl/get-outbound)
+          sender   (bound-fn* send-message!)]
+      (async/go-loop []
+        (when-some [msg (async/<! outbound)]
+          (async/<! (sender ws msg))
+          (recur)))
+      (let [{:keys [id]} (swap! wl/*state* assoc :socket ws)]
+        (swap! wl/sockets assoc id wl/*state*)))))
 
 (defn on-error [_ e]
-  (handle-exception e))
+  (with-named-thread (:upgrade-request @wl/*state*)
+    (handle-exception e)))
 
 (defn on-close [_ _ _]
-  ; remove visibility of any ongoing activities
-  (let [[{:keys [id outbound subscriptions]}] (reset-vals! wl/*state* {})]
-
-    (swap! wl/sockets dissoc id)
-
-    (quietly (async/close! outbound))
-
-    (doseq [sub (vals subscriptions)]
-      ; close all the open subscriptions
-      (quietly (async/close! sub)))))
+  (with-named-thread (:upgrade-request @wl/*state*)
+    (let [[{:keys [id outbound subscriptions]}] (reset-vals! wl/*state* {})]
+      (swap! wl/sockets dissoc id)
+      (quietly (async/close! outbound))
+      (doseq [sub (vals subscriptions)]
+        (quietly (async/close! sub))))))
 
 (defn on-command [_ {topic :id
                      proto :proto
                      data  :data
                      close :close
                      :or   {data {} close false proto :push}}]
-
-  (let [closure wl/*state*
-        {:keys [outbound subscriptions]} (deref closure)
-        ;;_ (log-pool-stats)
-        ]
-    
-
-    (case (some-> proto name strings/lower-case keyword)
-
-      :request
-      (safe-future
-       (let [response (wl/handle-request data)]
-         (async/put! outbound {:data response :proto proto :id topic})))
-
-      :subscription
-      (cond
-
-        (true? close)
-        (when-some [sub (get subscriptions topic)]
-          (async/close! sub))
-
-        (contains? subscriptions topic)
-        nil
-
-        :otherwise
+  (with-named-thread (:upgrade-request @wl/*state*)
+    (let [closure wl/*state*
+          {:keys [outbound subscriptions]} (deref closure)]
+      (case (some-> proto name strings/lower-case keyword)
+        :request
         (safe-future
-         (when-some [response (wl/handle-subscription data)]
-           (swap! closure assoc-in [:subscriptions topic] response)
-           (async/go-loop []
-             (if-some [res (async/<! response)]
-               (if (async/>! outbound {:data res :proto proto :id topic})
-                 (recur)
-                 (do (swap! closure update :subscriptions dissoc topic)
-                     (async/close! response)))
-               (let [[{old-subs :subscriptions}]
-                     (swap-vals! closure update :subscriptions dissoc topic)]
-                 (when (contains? old-subs topic)
-                   (async/>! outbound {:proto proto :id topic :close true}))))))))
+         (let [response (wl/handle-request data)]
+           (async/put! outbound {:data response :proto proto :id topic})))
 
-      :push
-      (safe-future (wl/handle-push data)))))
+        :subscription
+        (cond
+          (true? close)
+          (when-some [sub (get subscriptions topic)]
+            (async/close! sub))
+
+          (contains? subscriptions topic)
+          nil
+
+          :otherwise
+          (safe-future
+           (when-some [response (wl/handle-subscription data)]
+             (swap! closure assoc-in [:subscriptions topic] response)
+             (async/go-loop []
+               (if-some [res (async/<! response)]
+                 (if (async/>! outbound {:data res :proto proto :id topic})
+                   (recur)
+                   (do (swap! closure update :subscriptions dissoc topic)
+                       (async/close! response)))
+                 (let [[{old-subs :subscriptions}]
+                       (swap-vals! closure update :subscriptions dissoc topic)]
+                   (when (contains? old-subs topic)
+                     (async/>! outbound {:proto proto :id topic :close true}))))))))
+
+        :push
+        (safe-future (wl/handle-push data))))))
 
 (defn on-text [ws message]
-  (on-command ws (with-open [stream (ByteArrayInputStream. (.getBytes message))]
-                   (*decoder* stream))))
-
-(defn on-bytes [ws bites offset len]
-  (let [buffer (byte-array len)
-        _      (System/arraycopy bites offset buffer 0 len)]
-    (on-command ws (with-open [stream (ByteArrayInputStream. buffer)]
+  (with-named-thread (:upgrade-request @wl/*state*)
+    (on-command ws (with-open [stream (ByteArrayInputStream. (.getBytes message))]
                      (*decoder* stream)))))
 
-
+(defn on-bytes [ws bites offset len]
+  (with-named-thread (:upgrade-request @wl/*state*)
+    (let [buffer (byte-array len)
+          _      (System/arraycopy bites offset buffer 0 len)]
+      (on-command ws (with-open [stream (ByteArrayInputStream. buffer)]
+                       (*decoder* stream))))))
 
 (defn websocket-handler
   [{:keys [exception-handler encoding encoder decoder middleware max-threads]
@@ -193,7 +214,6 @@
                                 (if-some [handler (Thread/getDefaultUncaughtExceptionHandler)]
                                   (.uncaughtException handler (Thread/currentThread) exception)
                                   (.printStackTrace exception)))}}]
-  
   (let [encoder  (or encoder (get-in enc/encodings [encoding :encoder]))
         decoder  (or decoder (get-in enc/encodings [encoding :decoder]))
         executor (create-auto-resize-pool 10 max-threads 60)]
@@ -229,4 +249,3 @@
            :on-close   (mw state on-close)
            :on-text    (mw state on-text)
            :on-bytes   (mw state on-bytes)})))))
-
