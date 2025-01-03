@@ -216,7 +216,7 @@
                                   (.printStackTrace exception)))}}]
   (let [encoder  (or encoder (get-in enc/encodings [encoding :encoder]))
         decoder  (or decoder (get-in enc/encodings [encoding :decoder]))
-        executor (create-auto-resize-pool 10 max-threads 60)]
+        executor (create-auto-resize-pool 100 max-threads 60)]
     (->> (Thread. ^Runnable (fn [] (.shutdown executor)))
          (.addShutdownHook (Runtime/getRuntime)))
     (letfn [(message-bindings [handler state]

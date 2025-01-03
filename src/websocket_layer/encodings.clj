@@ -2,7 +2,8 @@
   (:require [jsonista.core :as json]
             [clojure.java.io :as io]
             [cognitect.transit :as transit]
-            [clojure.edn :as edn])
+            ;;[clojure.edn :as edn]
+            [fast-edn.core  :as edn])
   (:import (java.io ByteArrayOutputStream InputStream PushbackReader)
            (clojure.lang Reflector)
            (com.fasterxml.jackson.core JsonGenerator)
@@ -51,8 +52,9 @@
       (pr-str data))
     :decoder
     (fn [^InputStream data]
-      (with-open [reader (io/reader data)]
-        (edn/read (PushbackReader. reader))))}
+      ;; (with-open [reader (io/reader data)]
+      ;;   (edn/read (PushbackReader. reader)))
+      (edn/read-once data))}
    :json
    {:encoder
     (fn [data]
